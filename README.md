@@ -10,6 +10,10 @@ KUI面板正在集成融合免费免费住宅IP代理调度系统 https://github
 
 系统资源占用极低，非常适合用于个人量化交易、网络测试或轻度数据抓取。
 
+<img width="1733" height="1603" alt="图片" src="https://github.com/user-attachments/assets/2c25b18b-6f2a-441e-9eb0-602453231b71" />
+<img width="1692" height="1380" alt="图片" src="https://github.com/user-attachments/assets/a25f6ab3-820c-4dba-8c88-0829f76d97ae" />
+
+
 ## ✨ 核心特性
 
 * **⚡ 毫秒级极速调度**：采用 5 秒超时设定与 5 秒高频蓄水池抓取机制，节点假死后几秒内自动熔断并顶替新节点。
