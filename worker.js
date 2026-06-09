@@ -257,7 +257,8 @@ class Tunnel:
         self.table_id = table_id
         self.process = None
         self.node = None
-        self.ip = ""
+        self.entry_ip = ""
+        self.egress_ip = ""
         self.country = ""
         self.ready = False
         self.connected_at = 0
@@ -309,16 +310,16 @@ def update_config_loop():
                         if force_switch: print(f"[*] 收到强制更换指令，正在清退通道并拉黑当前 IP...", flush=True)
                         else: print(f"[*] 策略热切换: 目标重定向到 {desired_country}...", flush=True)
                         
-                        if tun_main.ip: dead_ips.add(tun_main.ip)
+                        if tun_main.entry_ip: dead_ips.add(tun_main.entry_ip)
                         if tun_main.process:
                             try: tun_main.process.terminate(); tun_main.process.wait(2)
                             except: tun_main.process.kill()
-                        tun_main.ready = False; tun_main.process = None; tun_main.ip = ""
+                        tun_main.ready = False; tun_main.process = None; tun_main.entry_ip = ""; tun_main.egress_ip = ""
                         
                         if tun_backup.process:
                             try: tun_backup.process.terminate(); tun_backup.process.wait(2)
                             except: tun_backup.process.kill()
-                        tun_backup.ready = False; tun_backup.process = None; tun_backup.ip = ""
+                        tun_backup.ready = False; tun_backup.process = None; tun_backup.entry_ip = ""; tun_backup.egress_ip = ""
                         
                         last_switch_trigger = switch_trigger
         except Exception as e: pass
@@ -339,7 +340,7 @@ def c2_heartbeat_loop():
                         "country": tun.country, 
                         "port": PROXY_PORT, 
                         "connected_time": int(uptime), 
-                        "node_ip": tun.ip
+                        "node_ip": tun.egress_ip if tun.egress_ip else tun.entry_ip
                     })
         
         payload = json.dumps({"ip": public_ip, "details": details, "logs": get_recent_logs()}).encode('utf-8')
@@ -431,10 +432,24 @@ def connect_node(tun: Tunnel, node: dict):
             setup_routing(tun.name, tun.table_id)
             time.sleep(1) 
             
-            # --- 修复核心逻辑：直接调用 JSON API 端点，精准匹配字段防误判 ---
+            # --- 穿透获取通道真实出口 IP ---
+            true_ip = ""
+            try:
+                true_ip_res = subprocess.run(["curl", "-s", "-m", "10", "--interface", tun.name, "https://api.ipify.org"], capture_output=True, text=True)
+                candidate_ip = true_ip_res.stdout.strip()
+                if candidate_ip and candidate_ip.count('.') == 3:
+                    true_ip = candidate_ip
+            except: pass
+            
+            egress_ip = true_ip if true_ip else node['ip']
+            
+            if true_ip and true_ip != node['ip']:
+                print(f"[*] {tun.name} 探测到真实出口 IP 与入口不一致: 入口 {node['ip']} -> 出口 {true_ip}", flush=True)
+
             is_residential = True
             try:
-                req_url = f"https://ip.net.coffee/api/ip/lookup/{node['ip']}"
+                # 使用 egress_ip 进行原生性检测
+                req_url = f"https://ip.net.coffee/api/ip/lookup/{egress_ip}"
                 check_req = urllib.request.Request(req_url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, method="GET")
                 with urllib.request.urlopen(check_req, timeout=10) as check_res:
                     data = json.loads(check_res.read().decode("utf-8"))
@@ -445,10 +460,9 @@ def connect_node(tun: Tunnel, node: dict):
                     if is_dc or company_type == "hosting" or asn_kind == "hosting":
                         is_residential = False
             except Exception as e: pass
-            # -----------------------------------------------------------
             
             if not is_residential:
-                print(f"[-] {tun.name} 节点检测为机房 IP，残忍抛弃: {node['ip']}", flush=True)
+                print(f"[-] {tun.name} 节点出口 ({egress_ip}) 检测为机房 IP，残忍抛弃！", flush=True)
                 dead_ips.add(node["ip"])
                 try: process.terminate(); process.wait(2)
                 except: process.kill()
@@ -457,7 +471,7 @@ def connect_node(tun: Tunnel, node: dict):
             print(f"[*] {tun.name} 进行流媒体质检 (YouTube)...", flush=True)
             res = subprocess.run(["curl", "-I", "-s", "-A", "Mozilla/5.0", "-m", "5", "--interface", tun.name, "https://www.youtube.com"], capture_output=True)
             if res.returncode != 0:
-                print(f"[-] {tun.name} 节点无法连通 YouTube，拉黑更换: {node['ip']}", flush=True)
+                print(f"[-] {tun.name} 节点出口无法连通 YouTube，拉黑更换: {node['ip']}", flush=True)
                 dead_ips.add(node["ip"])
                 try: process.terminate(); process.wait(2)
                 except: process.kill()
@@ -466,12 +480,13 @@ def connect_node(tun: Tunnel, node: dict):
             with state_lock:
                 tun.process = process
                 tun.node = node
-                tun.ip = node["ip"]
+                tun.entry_ip = node["ip"]
+                tun.egress_ip = egress_ip
                 tun.country = node["country"]
                 tun.connected_at = time.time()
                 tun.ready = True
             role = "主网卡" if proxy_server.ACTIVE_BIND == tun.name else "备用网卡"
-            print(f"[+] {tun.name} ({role}) 完全就绪: {node['ip']}", flush=True)
+            print(f"[+] {tun.name} ({role}) 完全就绪: 入口 {node['ip']} -> 出口 {egress_ip}", flush=True)
         else:
             try: process.terminate(); process.wait(2)
             except: process.kill()
@@ -484,21 +499,21 @@ def health_check_loop():
     while True:
         time.sleep(10)
         target_tun = ""
-        target_ip = ""
+        target_entry_ip = ""
         proc_ref = None
         
         with state_lock:
             if tun_main.ready and tun_main.process and tun_main.process.poll() is None:
                 if time.time() - tun_main.connected_at > 15:
                     target_tun = tun_main.name
-                    target_ip = tun_main.ip
+                    target_entry_ip = tun_main.entry_ip
                     proc_ref = tun_main.process
             if not target_tun: continue
                 
         res = subprocess.run(["curl", "-s", "-m", "5", "--interface", target_tun, "https://api.ipify.org"], capture_output=True)
         if res.returncode != 0:
-            print(f"[!] {target_tun} 通道假死断流，果断踢线: {target_ip}", flush=True)
-            dead_ips.add(target_ip)
+            print(f"[!] {target_tun} 通道假死断流，果断踢线: {target_entry_ip}", flush=True)
+            dead_ips.add(target_entry_ip)
             try: proc_ref.terminate(); proc_ref.wait(timeout=2)
             except: proc_ref.kill()
             with state_lock:
@@ -511,8 +526,8 @@ def get_best_candidate():
         candidates = [n for n in all_pool_nodes if n["country"] == target_country and n["ip"] not in dead_ips]
         
         active_ips = []
-        if tun_main.ip: active_ips.append(tun_main.ip)
-        if tun_backup.ip: active_ips.append(tun_backup.ip)
+        if tun_main.entry_ip: active_ips.append(tun_main.entry_ip)
+        if tun_backup.entry_ip: active_ips.append(tun_backup.entry_ip)
         candidates = [n for n in candidates if n["ip"] not in active_ips]
 
         if not candidates:
@@ -541,7 +556,7 @@ def maintain_pool():
             main_dead = (tun_main.process is None or tun_main.process.poll() is not None or not tun_main.ready)
             if main_dead:
                 if tun_backup.ready and tun_backup.process and tun_backup.process.poll() is None:
-                    print(f"[*] ⚡ 主通道暴毙，软开关秒切！无缝接管业务至备用通道: {tun_backup.ip}", flush=True)
+                    print(f"[*] ⚡ 主通道暴毙，软开关秒切！无缝接管业务至备用通道: 出口 {tun_backup.egress_ip or tun_backup.entry_ip}", flush=True)
                     # 状态互换 (身份对调)
                     tun_main, tun_backup = tun_backup, tun_main
                     proxy_server.ACTIVE_BIND = tun_main.name
@@ -550,13 +565,14 @@ def maintain_pool():
                     if tun_backup.process:
                         try: tun_backup.process.terminate(); tun_backup.process.wait(2)
                         except: tun_backup.process.kill()
-                    tun_backup.process = None; tun_backup.node = None; tun_backup.ip = ""
+                    tun_backup.process = None; tun_backup.node = None; tun_backup.entry_ip = ""; tun_backup.egress_ip = ""
                     tun_backup.ready = False; tun_backup.is_connecting = False
                 else:
                     if tun_main.process:
                         try: tun_main.process.terminate(); tun_main.process.wait(2)
                         except: tun_main.process.kill()
                     tun_main.process = None; tun_main.ready = False; tun_main.is_connecting = False
+                    tun_main.entry_ip = ""; tun_main.egress_ip = ""
 
         with state_lock:
             needs_main = not tun_main.ready and not tun_main.is_connecting
